@@ -135,6 +135,43 @@ def _is_windows_long_path_registry_enabled() -> bool:
     return bool(ntdll.RtlAreLongPathsEnabled())
 
 
+def _as_extended_length_path(original_path: Union[str, Path]) -> Path:
+    """
+    The extended-length (\\\\?\\ or \\\\?\\UNC\\) form of an absolute Windows path,
+    regardless of its length.
+
+    Unlike _get_long_path_compatible_path this does not consult the path's length.
+    It exists for directory walks: the walk ROOT can be well under the limit while
+    paths yielded beneath it exceed the limit, so a length gate on the root would
+    leave the yielded paths unprefixed. Prefixing the root makes every yielded path
+    inherit the prefix.
+
+    On non-Windows platforms, for relative paths (the prefix is only defined for
+    absolute paths), and for already-prefixed paths, returns the input unchanged.
+    """
+    original_path_string = str(original_path)
+    if sys.platform != "win32" or original_path_string.startswith(WINDOWS_UNC_PATH_STRING_PREFIX):
+        return Path(original_path_string)
+
+    # A prefixed path is handed to the filesystem verbatim, with the normalization
+    # that would otherwise accept forward slashes turned off, so separators have to
+    # be converted first. PureWindowsPath is used rather than Path because Path
+    # follows the running platform, and this branch is exercised on POSIX hosts by
+    # tests that patch sys.platform.
+    pure = PureWindowsPath(original_path_string)
+    if not pure.is_absolute() and not pure.drive.startswith(WINDOWS_PATH_SEPARATOR * 2):
+        return Path(original_path_string)
+    normalized = str(pure)
+
+    if pure.drive.startswith(WINDOWS_PATH_SEPARATOR * 2):
+        # A network path (\\server\share) takes the \\?\UNC\ form, which replaces the
+        # leading pair of backslashes with the prefix. Prepending \\?\ verbatim would
+        # produce \\?\\\server\share, which Windows rejects.
+        return Path(WINDOWS_UNC_DEVICE_PATH_STRING_PREFIX + normalized[2:])
+
+    return Path(WINDOWS_UNC_PATH_STRING_PREFIX + normalized)
+
+
 def _get_long_path_compatible_path(original_path: Union[str, Path]) -> Path:
     """
     Given a Path or string representing a path,
@@ -159,21 +196,7 @@ def _get_long_path_compatible_path(original_path: Union[str, Path]) -> Path:
         len(original_path_string) + TEMP_DOWNLOAD_ADDED_CHARS_LENGTH >= WINDOWS_MAX_PATH_LENGTH
         and not original_path_string.startswith(WINDOWS_UNC_PATH_STRING_PREFIX)
     ):
-        # A prefixed path is handed to the filesystem verbatim, with the normalization
-        # that would otherwise accept forward slashes turned off, so separators have to
-        # be converted first. PureWindowsPath is used rather than Path because Path
-        # follows the running platform, and this branch is exercised on POSIX hosts by
-        # tests that patch sys.platform.
-        pure = PureWindowsPath(original_path_string)
-        normalized = str(pure)
-
-        if pure.drive.startswith(WINDOWS_PATH_SEPARATOR * 2):
-            # A network path (\\server\share) takes the \\?\UNC\ form, which replaces the
-            # leading pair of backslashes with the prefix. Prepending \\?\ verbatim would
-            # produce \\?\\\server\share, which Windows rejects.
-            return Path(WINDOWS_UNC_DEVICE_PATH_STRING_PREFIX + normalized[2:])
-
-        return Path(WINDOWS_UNC_PATH_STRING_PREFIX + normalized)
+        return _as_extended_length_path(original_path_string)
     return Path(original_path_string)
 
 

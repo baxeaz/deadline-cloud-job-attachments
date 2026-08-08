@@ -69,9 +69,11 @@ from .os_file_permission import (
 )
 from ._path_summarization import human_readable_file_size
 from ._utils import (
+    _as_extended_length_path,
     _float_to_iso_datetime_string,
     _get_unique_dest_dir_name,
     _join_s3_paths,
+    _normalize_windows_path,
 )
 
 logger = getLogger("deadline.job_attachments")
@@ -604,7 +606,11 @@ class AssetSync:
             path_args["size"] = output.file_size
             # stat().st_mtime_ns returns an int that represents the time in nanoseconds since the epoch.
             # The asset manifest spec requires the mtime to be represented as an integer in microseconds.
-            path_args["mtime"] = trunc(Path(output.full_path).stat().st_mtime_ns // 1000)
+            # Stat via the extended-length form: full_path can exceed 260 chars and this
+            # also runs in processes that are not longPathAware.
+            path_args["mtime"] = trunc(
+                _as_extended_length_path(output.full_path).stat().st_mtime_ns // 1000
+            )
             paths.append(self.manifest_model.Path(**path_args))
 
         asset_manifest_args: dict[str, Any] = {
@@ -642,16 +648,28 @@ class AssetSync:
             total_file_count = 0
             total_file_size = 0
 
+            # Walk via the extended-length (\\?\) form so every yielded path inherits
+            # it: in a process that is not longPathAware (DCC-embedded interpreters,
+            # pythonservice.exe), stat/open on a plain >260-char path fails with
+            # WinError 3 even when the LongPathsEnabled registry value is set. The
+            # root itself can be short while paths beneath it are long, so this is
+            # deliberately not gated on the root's length. Plain forms are kept for
+            # bookkeeping: mtime-cache keys, relative paths, and logging must match
+            # the forms recorded elsewhere and shown to users.
+            search_root = _as_extended_length_path(output_root)
+
             # Don't fail if output dir hasn't been created yet; another task might be working on it
-            if not output_root.is_dir():
+            if not search_root.is_dir():
                 self.logger.info(f"Found 0 files (Output directory {output_root} does not exist.)")
                 continue
 
             # Get all files in this directory (includes sub-directories)
-            for file_path in output_root.glob("**/*"):
+            for found_path in search_root.glob("**/*"):
+                # Extended-length form for filesystem operations, plain form for bookkeeping.
+                file_path = _normalize_windows_path(found_path)
                 # Files that are new or have been modified since the last sync will be added to the output list.
                 mtime_when_synced = self.synced_assets_mtime.get(str(file_path), None)
-                file_mtime = file_path.stat().st_mtime_ns
+                file_mtime = found_path.stat().st_mtime_ns
                 is_modified = False
                 if mtime_when_synced:
                     if file_mtime > int(mtime_when_synced):
@@ -662,8 +680,13 @@ class AssetSync:
                     self.synced_assets_mtime[str(file_path)] = int(file_mtime)
                     is_modified = True
 
-                # Resolve the real path to prevent time-of-check/time-of-use vulnerability
-                file_real_path = file_path.resolve()
+                # Resolve the real path to prevent time-of-check/time-of-use vulnerability.
+                # Resolved via the extended-length form: resolving the plain form in a
+                # process that is not longPathAware falls back without resolving
+                # symlinks, which would neuter the containment check below. resolve()
+                # keeps the \\?\ prefix only when the plain form is unusable; both
+                # forms are handled by _is_file_within_directory and by stat/open.
+                file_real_path = found_path.resolve()
 
                 # validate that the file resolves inside of the session working directory.
                 is_file_path_under_session_dir = self._is_file_within_directory(
@@ -698,7 +721,9 @@ class AssetSync:
                             file_size=file_size,
                             file_hash=file_hash,
                             rel_path=str(PurePosixPath(*file_path.relative_to(local_root).parts)),
-                            full_path=str(file_real_path),
+                            # Plain form: full_path is surfaced in logs/summaries, and
+                            # every downstream file operation re-applies the prefix.
+                            full_path=str(_normalize_windows_path(file_real_path)),
                             s3_key=s3_key,
                             in_s3=in_s3,
                             base_dir=str(session_dir),
@@ -753,10 +778,15 @@ class AssetSync:
         # Record the mapping of downloaded files' absolute paths to their last modification time
         # (in microseconds). This is used to later determine which files have been modified or
         # newly created during the session and need to be uploaded as output.
+        # Keys stay in the plain form -- _get_output_files looks them up with plain
+        # paths -- while the stat goes through the extended-length form so a >260-char
+        # input path does not fail in a process that is not longPathAware.
         for local_root, merged_manifest in merged_manifests_by_root.items():
             for manifest_path in merged_manifest.paths:
                 abs_path = str(Path(local_root) / manifest_path.path)
-                self.synced_assets_mtime[abs_path] = Path(abs_path).stat().st_mtime_ns
+                self.synced_assets_mtime[abs_path] = (
+                    _as_extended_length_path(abs_path).stat().st_mtime_ns
+                )
 
     def _ensure_disk_capacity(self, session_dir: Path, total_input_bytes: int) -> None:
         """

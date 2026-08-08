@@ -263,9 +263,7 @@ def probe_output_sync(tmp_root: str) -> None:
             )
             return
 
-    if len(output_files) == 1:
-        record("output-sync", True, "long output file enumerated, hashed, and returned")
-    else:
+    if len(output_files) != 1:
         # Files silently skipped (e.g. glob or the containment check dropping them)
         # never upload: from the customer's perspective, outputs vanish. That is a
         # failure even though nothing raised.
@@ -274,6 +272,28 @@ def probe_output_sync(tmp_root: str) -> None:
             False,
             f"expected 1 output file, got {len(output_files)} -- long output was "
             "silently dropped (it would never be uploaded)",
+        )
+        return
+
+    # The manifest generation step stats each output's full_path again; it is a
+    # separate frame with the same long-path exposure.
+    try:
+        manifest = asset_sync._generate_output_manifest(output_files)
+    except BaseException as exc:  # noqa: BLE001
+        record(
+            "output-sync",
+            False,
+            "_generate_output_manifest raised while stat-ing a >260-char output path",
+            exc,
+        )
+        return
+    if len(manifest.paths) == 1:
+        record("output-sync", True, "long output enumerated, hashed, and manifested")
+    else:
+        record(
+            "output-sync",
+            False,
+            f"expected 1 manifest path, got {len(manifest.paths)}",
         )
 
 

@@ -14,6 +14,7 @@ from deadline.job_attachments._utils import (
     WINDOWS_MAX_PATH_LENGTH,
     WINDOWS_UNC_DEVICE_PATH_STRING_PREFIX,
     WINDOWS_UNC_PATH_STRING_PREFIX,
+    _as_extended_length_path,
     _get_long_path_compatible_path,
     _normalize_windows_path,
     _is_relative_to,
@@ -304,6 +305,58 @@ class TestGetLongPathCompatiblePath:
         read as relative and compare unequal against its own normal form.
         """
         assert str(_normalize_windows_path(prefixed)) == expected
+
+
+class TestAsExtendedLengthPath:
+    r"""
+    Tests for _as_extended_length_path, the unconditional variant used for directory
+    walks. A walk ROOT can be well under MAX_PATH while paths yielded beneath it exceed
+    it, so `asset_sync._get_output_files` prefixes the root regardless of its length and
+    lets every yielded path inherit the prefix. Without it, in a process that is not
+    longPathAware, `stat()` on a yielded >260-char path fails with WinError 3 even when
+    the LongPathsEnabled registry value is set (the customer configuration in
+    deadline-cloud-worker-agent#520).
+    """
+
+    @pytest.mark.parametrize(
+        ("original", "expected"),
+        [
+            (r"C:\short\path", WINDOWS_UNC_PATH_STRING_PREFIX + r"C:\short\path"),
+            (
+                r"\\studio-nas\projects\assets",
+                WINDOWS_UNC_DEVICE_PATH_STRING_PREFIX + r"studio-nas\projects\assets",
+            ),
+            ("C:/mixed/separators", WINDOWS_UNC_PATH_STRING_PREFIX + r"C:\mixed\separators"),
+        ],
+        ids=["short-drive-letter", "network", "forward-slashes"],
+    )
+    def test_prefixes_regardless_of_length(self, original, expected):
+        """Short paths are prefixed too: the length gate belongs to the caller's
+        context (single file op) and is deliberately absent here (walk root)."""
+        with patch.object(sys, "platform", "win32"):
+            assert str(_as_extended_length_path(original)) == expected
+
+    def test_already_prefixed_is_unchanged(self):
+        prefixed = WINDOWS_UNC_PATH_STRING_PREFIX + r"C:\already\prefixed"
+        with patch.object(sys, "platform", "win32"):
+            assert str(_as_extended_length_path(prefixed)) == prefixed
+
+    def test_relative_path_is_unchanged(self):
+        """The extended-length form is only defined for absolute paths."""
+        with patch.object(sys, "platform", "win32"):
+            assert str(_as_extended_length_path(r"relative\path")) == r"relative\path"
+
+    def test_non_windows_is_unchanged(self):
+        with patch.object(sys, "platform", "linux"):
+            assert _as_extended_length_path("/aaa/bbb") == Path("/aaa/bbb")
+
+    def test_round_trips_through_normalize(self):
+        """_normalize_windows_path must invert this helper for both path shapes, since
+        the walk keeps plain forms for bookkeeping and prefixed forms for file ops."""
+        for original in (r"C:\projects\scene.aep", r"\\studio-nas\projects\scene.aep"):
+            with patch.object(sys, "platform", "win32"):
+                prefixed = _as_extended_length_path(original)
+            assert str(_normalize_windows_path(prefixed)) == original
 
 
 @pytest.mark.skipif(
