@@ -25,8 +25,8 @@ powershell -ExecutionPolicy Bypass -File repro\run_repro.ps1
 #>
 [CmdletBinding()]
 param(
-    # Refs to test. pr-67 exists after: git fetch origin pull/67/head:pr-67 (or use your
-    # fork's branch name).
+    # Refs to test. pr-67 exists after: git fetch upstream pull/67/head:pr-67 (or use
+    # your fork's branch name).
     [string[]]$Refs = @("mainline", "pr-67"),
     # Working directory for worktrees, installed deps, and results.
     [string]$WorkDir = "C:\lp-repro-work"
@@ -36,6 +36,16 @@ $ErrorActionPreference = "Stop"
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 $reproDir = Join-Path $repoRoot "repro"
 New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
+
+# Runs a native command without PowerShell 5.1 promoting its stderr lines into
+# terminating errors (which it does under $ErrorActionPreference=Stop with 2>&1).
+# Returns @{ Output = <string[]>; ExitCode = <int> }.
+function Invoke-Native {
+    param([string]$Exe, [string[]]$Argv)
+    $ErrorActionPreference = "Continue"   # function-local scope
+    $output = & $Exe @Argv 2>&1 | ForEach-Object { "$_" }
+    return @{ Output = $output; ExitCode = $LASTEXITCODE }
+}
 
 # --- Preflight: registry must be ON (the scenario under test) -----------------------
 $reg = Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name LongPathsEnabled -ErrorAction SilentlyContinue
@@ -53,14 +63,24 @@ Write-Host "Stock python: $python"
 
 # --- Build the non-longPathAware interpreter -----------------------------------------
 Write-Host "`n=== Building non-longPathAware python ==="
-$nolpa = & $python (Join-Path $reproDir "make_non_longpathaware_python.py") 2>&1
-if ($LASTEXITCODE -ne 0) {
+$build = Invoke-Native $python @((Join-Path $reproDir "make_non_longpathaware_python.py"))
+if ($build.ExitCode -ne 0) {
     # Install dir not writable (e.g. system-wide install): fall back to a tree copy.
+    Write-Host ($build.Output -join "`n")
     Write-Host "Same-directory patch failed; retrying with --copy-tree"
-    $nolpa = & $python (Join-Path $reproDir "make_non_longpathaware_python.py") --copy-tree (Join-Path $WorkDir "py-nolpa") 2>&1
-    if ($LASTEXITCODE -ne 0) { Write-Error "Could not build non-longPathAware python:`n$nolpa" }
+    $build = Invoke-Native $python @(
+        (Join-Path $reproDir "make_non_longpathaware_python.py"),
+        "--copy-tree", (Join-Path $WorkDir "py-nolpa"))
+    if ($build.ExitCode -ne 0) {
+        Write-Error ("Could not build non-longPathAware python:`n" + ($build.Output -join "`n"))
+    }
 }
-$nolpa = ($nolpa | Select-Object -Last 1).ToString().Trim()
+# Diagnostics go to stderr; the final stdout line is the interpreter path.
+$build.Output | Where-Object { $_ -notmatch "^(NOTE|patched|ERROR)" } | Write-Host
+$nolpa = ($build.Output | Where-Object { $_ -match "\.exe$" } | Select-Object -Last 1).Trim()
+if (-not $nolpa -or -not (Test-Path $nolpa)) {
+    Write-Error ("Could not determine patched interpreter path from output:`n" + ($build.Output -join "`n"))
+}
 Write-Host "Non-aware python: $nolpa"
 
 # --- Run the matrix -------------------------------------------------------------------
@@ -72,32 +92,34 @@ foreach ($ref in $Refs) {
 
     if (-not (Test-Path $worktree)) {
         Write-Host "`n=== Preparing worktree for $ref ==="
-        git -C $repoRoot worktree add --detach $worktree $ref
-        if ($LASTEXITCODE -ne 0) { Write-Error "git worktree add failed for $ref" }
+        $wt = Invoke-Native "git" @("-C", "$repoRoot", "worktree", "add", "--detach", $worktree, $ref)
+        if ($wt.ExitCode -ne 0) { Write-Error ("git worktree add failed for ${ref}:`n" + ($wt.Output -join "`n")) }
     }
     if (-not (Test-Path $deps)) {
         Write-Host "=== Installing $ref into $deps ==="
-        & $python -m pip install --quiet --target $deps $worktree moto xxhash
-        if ($LASTEXITCODE -ne 0) { Write-Error "pip install failed for $ref" }
+        $pip = Invoke-Native $python @("-m", "pip", "install", "--quiet", "--target", $deps, $worktree, "moto", "xxhash")
+        if ($pip.ExitCode -ne 0) { Write-Error ("pip install failed for ${ref}:`n" + ($pip.Output -join "`n")) }
     }
 
     foreach ($mode in @("stock", "non-aware")) {
         $exe = if ($mode -eq "stock") { $python } else { $nolpa }
-        $flags = if ($mode -eq "non-aware") { @("--require-host-unaware") } else { @() }
         $jsonOut = Join-Path $WorkDir "result-$safeRef-$mode.json"
 
         Write-Host "`n=== $ref / $mode python ===" -ForegroundColor Cyan
-        $env:PYTHONPATH = $deps
         # -s: ignore user site-packages so only $deps supplies the package under test.
-        & $exe -s (Join-Path $reproDir "windows_longpath_repro.py") @flags --json $jsonOut
-        $code = $LASTEXITCODE
+        $argv = @("-s", (Join-Path $reproDir "windows_longpath_repro.py"), "--json", $jsonOut)
+        if ($mode -eq "non-aware") { $argv += "--require-host-unaware" }
+
+        $env:PYTHONPATH = $deps
+        $run = Invoke-Native $exe $argv
         $env:PYTHONPATH = $null
+        Write-Host ($run.Output -join "`n")
 
         $probes = if (Test-Path $jsonOut) { Get-Content $jsonOut | ConvertFrom-Json } else { @() }
         $matrix += [pscustomobject]@{
             Ref        = $ref
             Python     = $mode
-            ExitCode   = $code
+            ExitCode   = $run.ExitCode
             Download   = ($probes | Where-Object probe -eq "download").result
             OutputSync = ($probes | Where-Object probe -eq "output-sync").result
         }
