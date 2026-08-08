@@ -65,12 +65,15 @@ Write-Host "Stock python: $python"
 Write-Host "`n=== Building non-longPathAware python ==="
 $build = Invoke-Native $python @((Join-Path $reproDir "make_non_longpathaware_python.py"))
 if ($build.ExitCode -ne 0) {
-    # Install dir not writable (e.g. system-wide install): fall back to a tree copy.
     Write-Host ($build.Output -join "`n")
-    Write-Host "Same-directory patch failed; retrying with --copy-tree"
-    $build = Invoke-Native $python @(
-        (Join-Path $reproDir "make_non_longpathaware_python.py"),
-        "--copy-tree", (Join-Path $WorkDir "py-nolpa"))
+    # Only a permissions failure is fixable by copying the install tree; anything else
+    # (patch rejected, launch failure) would just recur after a potentially huge copy.
+    if ($build.Output -match "not writable") {
+        Write-Host "Install directory not writable; retrying with --copy-tree"
+        $build = Invoke-Native $python @(
+            (Join-Path $reproDir "make_non_longpathaware_python.py"),
+            "--copy-tree", (Join-Path $WorkDir "py-nolpa"))
+    }
     if ($build.ExitCode -ne 0) {
         Write-Error ("Could not build non-longPathAware python:`n" + ($build.Output -join "`n"))
     }

@@ -7,12 +7,15 @@ so a stock interpreter can never reproduce the environment of a DCC-embedded
 interpreter or pywin32's pythonservice.exe. This tool clears the flag in a copy,
 giving a stand-in "application" for that environment without needing a DCC install.
 
-How: byte-patches the copy, renaming the manifest's `longPathAware` element to a
-same-length unknown name. The Windows loader ignores unknown windowsSettings
-elements, so the effect is identical to never declaring the setting. Same-length
-substitution means no PE resource tables, sizes, or offsets change, and no
-UpdateResourceW/ctypes-callback machinery is needed (the resource-API approach
-fatally crashes some interpreters, e.g. conda/miniforge Python 3.13).
+How: byte-patches the copy, changing the manifest's longPathAware VALUE from 'true'
+to 'fals' (same length). The element name is left alone: SxS schema-validates the
+element names in the windowsSettings namespaces at activation-context creation and
+rejects unknown ones with WinError 14001, but the value text is not validated there.
+At runtime the loader compares the value against "true" (case-insensitive); anything
+else means the setting is off. Same-length substitution means no PE resource tables,
+sizes, or offsets change, and no UpdateResourceW/ctypes-callback machinery is needed
+(the resource-API approach fatally crashes some interpreters, e.g. conda/miniforge
+Python 3.13).
 
 The copy is placed in the SAME directory as the source python.exe so it finds
 python3xx.dll and the standard library without further setup. If that directory is
@@ -29,43 +32,35 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shutil
 import subprocess
 import sys
 
-NEEDLE = b"longPathAware"
-# Same length, unknown element name: <ws2:XongPathAware>true</...> is ignored by the
-# loader, which is equivalent to not declaring the setting at all.
-REPLACEMENT = b"XongPathAware"
-assert len(NEEDLE) == len(REPLACEMENT)
+# Matches the opening tag through its value: <ws2:longPathAware ...>true
+# The value is replaced with same-length 'fals', which the runtime's exact
+# (case-insensitive) comparison against "true" treats as off. The element NAME must
+# not be altered: SxS validates windowsSettings element names at activation-context
+# creation and an unknown name kills process start with WinError 14001.
+_VALUE_PATTERN = re.compile(rb"(longPathAware[^<]{0,200}?>\s*)true", re.IGNORECASE)
+_REPLACEMENT_VALUE = b"fals"
 
 
 def patch_manifest_bytes(exe_path: str) -> int:
-    """Rename every tag-context occurrence of longPathAware in the binary.
+    """Flip every longPathAware value from 'true' to 'fals' in the binary.
 
-    Returns the number of occurrences patched. Only occurrences immediately preceded
-    by ':', '<', or '/' (i.e. XML tag names like <ws2:longPathAware> and
-    </ws2:longPathAware>) are touched, so an incidental occurrence of the string in
-    code or data is left alone.
+    Returns the number of occurrences patched. Same-length substitution, so no PE
+    offsets change.
     """
     with open(exe_path, "rb") as f:
-        blob = bytearray(f.read())
+        blob = f.read()
 
-    patched = 0
-    start = 0
-    while True:
-        i = blob.find(NEEDLE, start)
-        if i == -1:
-            break
-        if i > 0 and blob[i - 1 : i] in (b":", b"<", b"/"):
-            blob[i : i + len(NEEDLE)] = REPLACEMENT
-            patched += 1
-        start = i + len(NEEDLE)
-
-    if patched:
+    patched_blob, count = _VALUE_PATTERN.subn(rb"\g<1>" + _REPLACEMENT_VALUE, blob)
+    if count:
+        assert len(patched_blob) == len(blob), "patch must not change binary size"
         with open(exe_path, "wb") as f:
-            f.write(blob)
-    return patched
+            f.write(patched_blob)
+    return count
 
 
 def is_long_path_aware(exe: str) -> bool:
@@ -169,27 +164,39 @@ def main() -> int:
     patched = patch_manifest_bytes(dst)
     if patched == 0:
         print(
-            f"ERROR: no tag-context 'longPathAware' occurrences found in {dst}, yet the "
+            f"ERROR: no 'longPathAware...>true' occurrence found in {dst}, yet the "
             "interpreter reports itself long path aware. Its manifest may live in an "
             "external .manifest file or a launcher; patch that instead.",
             file=sys.stderr,
         )
+        os.unlink(dst)
         return 1
-    if patched > 4:
+    if patched > 2:
         print(
-            f"ERROR: {patched} occurrences patched -- more than a manifest open+close "
-            "tag pair should produce. Refusing to trust the result; inspect the binary.",
+            f"ERROR: {patched} occurrences patched -- more than a manifest should "
+            "produce. Refusing to trust the result; inspect the binary.",
             file=sys.stderr,
         )
         os.unlink(dst)
         return 1
 
-    if is_long_path_aware(dst):
+    try:
+        still_aware = is_long_path_aware(dst)
+    except OSError as e:
+        print(
+            f"ERROR: patched interpreter failed to launch ({e}). The manifest edit "
+            "was rejected by the loader; the copy has been removed.",
+            file=sys.stderr,
+        )
+        os.unlink(dst)
+        return 1
+    if still_aware:
         print(
             "ERROR: patched interpreter still reports RtlAreLongPathsEnabled()=1; "
             "the manifest edit did not take effect.",
             file=sys.stderr,
         )
+        os.unlink(dst)
         return 1
 
     print(f"patched {patched} manifest occurrence(s)", file=sys.stderr)
