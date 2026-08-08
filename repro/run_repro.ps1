@@ -33,6 +33,9 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+# `powershell -File` passes arguments as literal strings, so "-Refs a,b,c" arrives as
+# a single element. Split it here so both invocation styles work.
+$Refs = @($Refs | ForEach-Object { $_ -split "," } | Where-Object { $_ })
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 $reproDir = Join-Path $repoRoot "repro"
 New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
