@@ -728,6 +728,97 @@ class TestAssetSync:
             is False
         )
 
+    @pytest.mark.skipif(sys.platform != "win32", reason="Windows long-path behavior")
+    def test_output_sync_handles_long_path_in_non_long_path_aware_process(
+        self,
+        tmp_path: Path,
+        default_job_attachment_s3_settings: JobAttachmentS3Settings,
+    ):
+        """A long output is enumerated, hashed, and manifested when the host process
+        is not longPathAware, including Python 3.8 behavior where resolve() removes
+        an extended-length prefix.
+
+        Stock python.exe is longPathAware, so an ordinary Windows filesystem test
+        passes even before the fix. The stat/lstat wrappers reproduce the filesystem
+        failure mode of DCC hosts and pythonservice.exe by rejecting unprefixed paths
+        at or above MAX_PATH. The resolve wrapper reproduces Python 3.8's behavior of
+        returning a plain path after resolving an extended-length input.
+        """
+        from deadline.job_attachments._utils import (
+            WINDOWS_MAX_PATH_LENGTH,
+            WINDOWS_UNC_PATH_STRING_PREFIX,
+            _get_long_path_compatible_path,
+            _normalize_windows_path,
+        )
+
+        session_dir = tmp_path / "session"
+        local_root = session_dir / "assetroot"
+        output_root = local_root / "output"
+
+        components = ["component_00_" + "x" * 20]
+        long_file = output_root.joinpath(*components, "render.exr")
+        while len(str(long_file)) < WINDOWS_MAX_PATH_LENGTH + 20:
+            components.append(f"component_{len(components):02d}_" + "x" * 20)
+            long_file = output_root.joinpath(*components, "render.exr")
+
+        extended_file = _get_long_path_compatible_path(long_file)
+        extended_file.parent.mkdir(parents=True)
+        extended_file.write_bytes(b"render output")
+        original_mtime = extended_file.stat().st_mtime_ns
+
+        # Input-sync bookkeeping stores plain paths. Make the output look modified
+        # and verify that prefixed enumeration finds the same cache key.
+        self.default_asset_sync.synced_assets_mtime[str(long_file)] = original_mtime - 1
+
+        original_resolve = Path.resolve
+        original_stat = Path.stat
+        original_lstat = Path.lstat
+
+        def resolve_like_python_38(path: Path, *args, **kwargs) -> Path:
+            return _normalize_windows_path(original_resolve(path, *args, **kwargs))
+
+        def reject_unprefixed_long_path(path: Path) -> None:
+            value = str(path)
+            if len(value) >= WINDOWS_MAX_PATH_LENGTH and not value.startswith(
+                WINDOWS_UNC_PATH_STRING_PREFIX
+            ):
+                raise FileNotFoundError(3, "The system cannot find the path specified", value)
+
+        def stat_like_non_long_path_aware(path: Path, *args, **kwargs):
+            reject_unprefixed_long_path(path)
+            return original_stat(path, *args, **kwargs)
+
+        def lstat_like_non_long_path_aware(path: Path, *args, **kwargs):
+            reject_unprefixed_long_path(path)
+            return original_lstat(path, *args, **kwargs)
+
+        manifest_properties = ManifestProperties(
+            rootPath=str(local_root),
+            rootPathFormat=PathFormat.WINDOWS,
+            outputRelativeDirectories=["output"],
+        )
+
+        with patch.object(Path, "resolve", resolve_like_python_38), patch.object(
+            Path, "stat", stat_like_non_long_path_aware
+        ), patch.object(Path, "lstat", lstat_like_non_long_path_aware), patch.object(
+            self.default_asset_sync.s3_uploader,
+            "file_already_uploaded",
+            return_value=False,
+        ):
+            outputs = self.default_asset_sync._get_output_files(
+                manifest_properties,
+                default_job_attachment_s3_settings,
+                local_root,
+                session_dir,
+            )
+            output_manifest = self.default_asset_sync._generate_output_manifest(outputs)
+
+        assert len(outputs) == 1
+        assert outputs[0].rel_path == long_file.relative_to(local_root).as_posix()
+        assert not outputs[0].full_path.startswith(WINDOWS_UNC_PATH_STRING_PREFIX)
+        assert len(output_manifest.paths) == 1
+        assert output_manifest.paths[0].path == outputs[0].rel_path
+
     @pytest.mark.skipif(sys.platform != "win32", reason="\\\\?\\ prefix is Windows-only")
     def test_is_file_within_directory_mixed_prefixed_and_plain(self, tmp_path: Path):
         # On Python 3.13, Path.resolve() keeps the \\?\ prefix when the input has
