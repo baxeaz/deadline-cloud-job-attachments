@@ -742,8 +742,11 @@ class AssetSync:
         """
         Checks if the given file path is within the given directory path.
         """
-        real_file_path = file_path.resolve()
-        real_directory_path = directory_path.resolve()
+        # Strip any \\?\ prefix before commonpath: on Python 3.13, resolve() on
+        # a prefixed input keeps the prefix, and commonpath rejects mixed drives
+        # like \\?\C: vs C: with ValueError. Callers may pass either form.
+        real_file_path = _normalize_windows_path(file_path.resolve())
+        real_directory_path = _normalize_windows_path(directory_path.resolve())
         common_path = os.path.commonpath([real_file_path, real_directory_path])
         return common_path.startswith(str(real_directory_path))
 

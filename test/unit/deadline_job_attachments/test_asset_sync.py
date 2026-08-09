@@ -6,6 +6,7 @@ import json
 from logging import getLogger
 import os
 import shutil
+import sys
 from math import trunc
 from pathlib import Path
 from typing import Optional, Dict
@@ -725,6 +726,27 @@ class TestAssetSync:
         assert (
             self.default_asset_sync._is_file_within_directory(symlink_path_outside, tmp_dir)
             is False
+        )
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="\\\\?\\ prefix is Windows-only")
+    def test_is_file_within_directory_mixed_prefixed_and_plain(self, tmp_path: Path):
+        # On Python 3.13, Path.resolve() keeps the \\?\ prefix when the input has
+        # one, so a prefixed file path compared against a plain session-dir path
+        # would previously raise ValueError from commonpath (mixed drives
+        # \\?\C: vs C:). _get_output_files feeds this exact combination.
+        tmp_dir = tmp_path / "tmp_dir"
+        tmp_dir.mkdir()
+        inside_file_path = tmp_dir / "file.txt"
+        inside_file_path.touch()
+
+        prefixed_file = Path("\\\\?\\" + str(inside_file_path))
+
+        assert self.default_asset_sync._is_file_within_directory(prefixed_file, tmp_dir) is True
+        assert (
+            self.default_asset_sync._is_file_within_directory(
+                inside_file_path, Path("\\\\?\\" + str(tmp_dir))
+            )
+            is True
         )
 
     @pytest.mark.parametrize(
