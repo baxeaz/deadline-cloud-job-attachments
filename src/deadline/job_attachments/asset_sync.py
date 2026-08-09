@@ -681,12 +681,12 @@ class AssetSync:
                     is_modified = True
 
                 # Resolve the real path to prevent time-of-check/time-of-use vulnerability.
-                # Resolved via the extended-length form: resolving the plain form in a
-                # process that is not longPathAware falls back without resolving
-                # symlinks, which would neuter the containment check below. resolve()
-                # keeps the \\?\ prefix only when the plain form is unusable; both
-                # forms are handled by _is_file_within_directory and by stat/open.
-                file_real_path = found_path.resolve()
+                # Wrap resolve() with _as_extended_length_path because Path.resolve() on
+                # Python 3.8 strips the \\?\ prefix even when the input has it (fixed
+                # only in 3.10+), and subsequent stat/is_dir/exists on the plain form
+                # then fail in a process that is not longPathAware. _is_file_within_directory
+                # is prefix-tolerant, so the extended form here is safe for both branches.
+                file_real_path = _as_extended_length_path(found_path.resolve())
 
                 # validate that the file resolves inside of the session working directory.
                 is_file_path_under_session_dir = self._is_file_within_directory(
@@ -705,7 +705,7 @@ class AssetSync:
                     and is_modified
                     and is_file_path_under_session_dir
                 ):
-                    file_size = file_real_path.resolve().lstat().st_size
+                    file_size = file_real_path.lstat().st_size
                     file_hash = hash_file(str(file_real_path), self.hash_alg)
                     s3_key = f"{file_hash}.{self.hash_alg.value}"
 
