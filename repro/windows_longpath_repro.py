@@ -117,7 +117,7 @@ def environment_report(require_host_unaware: bool) -> bool:
             "ERROR: LongPathsEnabled registry value is not 1. The scenario under test is\n"
             "registry ON. Enable it and re-run:\n"
             '  Set-ItemProperty "HKLM:\\SYSTEM\\CurrentControlSet\\Control\\FileSystem" '
-            '-Name LongPathsEnabled -Value 1  (then reboot or re-login)'
+            "-Name LongPathsEnabled -Value 1  (then reboot or re-login)"
         )
         return False
     if require_host_unaware and process_aware:
@@ -172,9 +172,7 @@ def probe_download(tmp_root: str) -> None:
     with mock_aws():
         s3 = boto3.client("s3", region_name="us-east-1")
         s3.create_bucket(Bucket="longpath-repro")
-        s3.put_object(
-            Bucket="longpath-repro", Key=f"Data/{file_hash}.xxh128", Body=data
-        )
+        s3.put_object(Bucket="longpath-repro", Key=f"Data/{file_hash}.xxh128", Body=data)
         manifest_file = ManifestPath(
             path=rel_path, hash=file_hash, size=len(data), mtime=int(time.time() * 1_000_000)
         )
